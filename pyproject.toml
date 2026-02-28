@@ -1,0 +1,11 @@
+[project]
+name = "pfp"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "django>=6.0.2",
+    "numpy>=2.4.2",
+    "opencv-python>=4.11.0",
+]

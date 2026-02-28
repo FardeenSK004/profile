@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[oc]
+*.pyo
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Django
+db.sqlite3
+staticfiles/
+*.log
+
+# Environment variables
+.env
+.env.*
+
+# Test / sample data (not for production)
+approved/
+rejected/
+
+# IDE
+.vscode/
+.idea/
