@@ -25,6 +25,25 @@ def _detect_faces(gray):
     if len(faces) == 0:
         faces = profile_cascade.detectMultiScale(
             gray, scaleFactor=1.1, minNeighbors=6, minSize=(40, 40))
+
+    if len(faces) == 0:
+        # Fallback for Niqab: If no face detected but clear eyes found, synthesize a face box
+        eyes = eye_cascade.detectMultiScale(gray, 1.1, 5, minSize=(15, 15))
+        if len(eyes) >= 2:
+            eyes = sorted(eyes, key=lambda e: e[0])
+            e1, e2 = eyes[0], eyes[-1]
+            x1, y1 = e1[0], min(e1[1], e2[1])
+            x2, y2 = e2[0] + e2[2], max(e1[1] + e1[3], e2[1] + e2[3])
+            ew, eh = x2 - x1, y2 - y1
+
+            # Synthesize a realistic face bounding box around the eyes
+            fw = int(ew * 2.5)
+            fh = int(fw * 1.5)
+            fx = max(0, x1 - int(ew * 0.75))
+            fy = max(0, y1 - int(fh * 0.25))
+
+            faces = [np.array([fx, fy, fw, fh], dtype=np.int32)]
+
     return list(faces)
 
 
@@ -63,7 +82,11 @@ def _is_rotated_image(gray):
     """
     Detects if the image content is rotated (90° / 180° / 270°).
     Returns (is_rotated: bool, fix_hint: str).
-    fix_hint describes what the user should do to fix the orientation.
+    An image is only flagged as rotated if all three conditions hold:
+      - The best rotated angle finds >= 2 faces (not a spurious single match)
+      - The best rotated count is strictly more than 2x the upright count
+        OR upright has 0 faces but the rotated angle has faces.
+    This prevents low-quality JPEG compression from causing false positives.
     """
     count_0   = _faces_at_angle(gray, 0)
     count_90  = _faces_at_angle(gray, 90)
@@ -74,7 +97,17 @@ def _is_rotated_image(gray):
     max_rotated_angle = max(rotated_counts, key=rotated_counts.get)
     max_rotated_count = rotated_counts[max_rotated_angle]
 
-    is_rotated = (max_rotated_count > count_0) or (count_0 == 0 and max_rotated_count > 0)
+    # Only flag as rotated if:
+    # a) Upright finds 0 faces but a rotated angle finds some, OR
+    # b) Rotated count is >= 3 AND strictly more than 2x upright count + 1
+    #    (requiring a large majority to avoid compression artefact false positives)
+    if count_0 == 0 and max_rotated_count > 0:
+        is_rotated = True
+    elif max_rotated_count >= 3 and max_rotated_count > count_0 * 2 + 1:
+        is_rotated = True
+    else:
+        is_rotated = False
+
     hint = _ROTATION_FIX.get(max_rotated_angle, "rotate it to be upright")
     return is_rotated, hint
 
@@ -116,8 +149,9 @@ def _has_unnatural_hair_color(roi_bgr):
     green (Hue 60-80), bright pink (Hue 150-175).
     """
     hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
-    # Focus on upper 40% of face ROI where hair tends to be
-    h_crop = int(roi_bgr.shape[0] * 0.4)
+    # Focus only on the top 25% of the face ROI where hair tends to be.
+    # This prevents red lipstick or clothing in the lower half from triggering it.
+    h_crop = int(roi_bgr.shape[0] * 0.25)
     upper_hsv = hsv[:h_crop, :, :]
 
     hue = upper_hsv[:, :, 0]
@@ -163,8 +197,10 @@ def _is_anime_illustration(roi_bgr, is_face_roi=False):
         return True
 
     # 4. Very high uniform saturation (vivid anime colours)
+    #    s_std < 44: real-world outdoor photos with saturated backgrounds have s_std > 38
+    #    Flat anime colours tend to have s_std < 30 (very uniform)
     s_mean, s_std = _saturation_stats(roi_bgr)
-    if s_mean > 110 and s_std < 38:
+    if s_mean > 110 and s_std < 30:
         return True
 
     # 5. Smooth-rendered illustration (Ghibli / Disney style):
@@ -175,6 +211,15 @@ def _is_anime_illustration(roi_bgr, is_face_roi=False):
         gray    = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
         lap_std = cv2.Laplacian(gray, cv2.CV_64F).std()
         if lap_std < 28 and s_mean > 95:
+            # Niqabs/dark hijabs often trigger this due to low texture + high saturation noise.
+            # If we detect clear human eyes on the image, spare it from this rejection.
+            eyes = eye_cascade.detectMultiScale(gray, 1.1, 5, minSize=(15, 15))
+            if len(eyes) >= 2:
+                return False
+            # High s_mean from a vivid background (e.g. green leafy background) inflates
+            # the score without the image being an illustration — add diversity gate.
+            if diversity >= 90:
+                return False
             return True
 
     return False
@@ -219,18 +264,21 @@ def _large_obstruction(img_bgr, x, y, w, h):
     skin_mask = cv2.inRange(ycbcr,
                             np.array([0,  133,  77], np.uint8),
                             np.array([255, 173, 127], np.uint8))
-    total_px  = w * h
-    skin_px   = np.sum(skin_mask > 0)
-    non_skin  = total_px - skin_px
-
+    
     gray_face = cv2.cvtColor(face_roi, cv2.COLOR_BGR2GRAY)
-    # Dark non-skin pixels (phone body, device held in hand)
-    dark_non_skin = np.sum((gray_face < 60) & (skin_mask == 0))
+    
+    # We care mostly about the UPPER half of the face for true obstructions (phones, etc).
+    # The lower half being dark non-skin is very common for Hijabs, Niqabs, or dark collared shirts.
+    h_half = h // 2
+    upper_gray = gray_face[:h_half, :]
+    upper_skin = skin_mask[:h_half, :]
+    
+    # Dark non-skin pixels in the upper half (e.g. phone held high, large dark sunglasses)
+    dark_upper = np.sum((upper_gray < 70) & (upper_skin == 0))
+    upper_ratio = dark_upper / max(w * h_half, 1)
 
-    dark_ratio = dark_non_skin / max(total_px, 1)
-
-    # If more than 25% of the face bounding box is dark non-skin → object blocking
-    return dark_ratio > 0.25
+    # If more than 35% of the UPPER face bounding box is dark non-skin → object blocking
+    return upper_ratio > 0.35
 
 
 def _check_face_tilt(face_roi_gray):
@@ -314,8 +362,12 @@ def analyze_image(image_bytes):
         #  0b. Whole-image illustration pre-check
         #  Run this BEFORE the rotation test so anime/cartoon art is caught
         #  with the right reason (the rotation cascade can match on flat art).
+        #  EXCEPTION: if frontal cascade already found a face upright, it's likely
+        #  a real person — skip this pre-check and rely on face-ROI check instead.
         # ------------------------------------------------------------------ #
-        if _is_anime_illustration(img, is_face_roi=False):
+        upright_faces = frontal_cascade.detectMultiScale(
+            gray, scaleFactor=1.1, minNeighbors=6, minSize=(40, 40))
+        if len(upright_faces) == 0 and _is_anime_illustration(img, is_face_roi=False):
             return False, 0, [
                 "Image looks like an illustration, anime, or cartoon artwork. "
                 "Profile pictures must be real photographs of the doctor."
@@ -346,11 +398,15 @@ def analyze_image(image_bytes):
         x, y, w, h = faces[0]
         face_roi = img[y:y + h, x:x + w]
 
+        # Determine if there are clear eyes in the image (used for hijab/niqab bypassing)
+        eyes_detected = eye_cascade.detectMultiScale(gray, 1.1, 5, minSize=(15, 15))
+        has_clear_eyes = len(eyes_detected) >= 2
+
         # ------------------------------------------------------------------ #
         #  2. Face must not be clipped at image edge (partial / cut-off face)
         # ------------------------------------------------------------------ #
         # Standard edge-clip check
-        if _face_cut_off(x, y, w, h, img_w, img_h, margin=8):
+        if not has_clear_eyes and _face_cut_off(x, y, w, h, img_w, img_h, margin=8):
             return False, 0, [
                 "Your face appears to be partially outside the frame. "
                 "Please use a photo where your full face is clearly visible."
@@ -359,7 +415,7 @@ def analyze_image(image_bytes):
         # Extra check: if the top of the detected face is very low in the image
         # relative to image height, the top of the head/forehead is cut off.
         # A proper headshot will have forehead visible near the top ~30% of the image.
-        if y > img_h * 0.45:
+        if not has_clear_eyes and y > img_h * 0.45:
             return False, 0, [
                 "Your face appears to be partially cut off (top of head missing). "
                 "Please use a photo where your full face is clearly visible."
@@ -371,6 +427,23 @@ def analyze_image(image_bytes):
         img_area  = img_w * img_h
         face_area = w * h
         face_ratio = face_area / img_area
+
+        # Niqab / eye-region expansion:
+        # If the box is very small, it might just be the eye slit of a Niqab detected as a face.
+        # Check the *full image* for clear eyes to bypass overly strict face bounds.
+        eyes_detected = eye_cascade.detectMultiScale(gray, 1.1, 5, minSize=(15, 15))
+        has_clear_eyes = len(eyes_detected) >= 2
+
+        if has_clear_eyes and face_ratio < 0.08:
+            # Artificially expand bounding box to simulate full head
+            h_new = min(img_h - y, int(h * 2.5))
+            w_new = min(img_w - x, int(w * 1.5))
+            x_new = max(0, int(x - w * 0.16))
+            y_new = max(0, int(y - h * 0.15))
+            x, y, w, h = x_new, y_new, w_new, h_new
+            face_roi = img[y:y + h, x:x + w]
+            face_area = w * h
+            face_ratio = face_area / img_area
 
         # Hard reject for very small faces: these are scene/group photos or
         # photos where the person is far away — not suitable profile pictures.
@@ -408,7 +481,12 @@ def analyze_image(image_bytes):
         # ------------------------------------------------------------------ #
         #  6. Object / phone obstruction check
         # ------------------------------------------------------------------ #
-        if _large_obstruction(img, x, y, w, h):
+        # Bypass if we strongly detect two eyes (to allow Hijabs and Niqabs where
+        # fabric takes up most of the non-skin face region).
+        # Also bypass if the face is an extreme close-up (w > 80% of image),
+        # where the "background" is entirely dark clothing.
+        is_extreme_closeup = w > img_w * 0.8
+        if not has_clear_eyes and not is_extreme_closeup and _large_obstruction(img, x, y, w, h):
             return False, 0, [
                 "A large object (e.g. phone, mask) appears to be blocking your face. "
                 "Please upload a clear headshot without obstructions."
@@ -443,7 +521,9 @@ def analyze_image(image_bytes):
         #  7. Skin tone check
         # ------------------------------------------------------------------ #
         skin = _skin_ratio(inner)
-        if skin < 0.12:
+        # Lower skin threshold significantly if it's a Niqab/Hijab (where mostly eyes show)
+        min_skin = 0.02 if has_clear_eyes else 0.12
+        if skin < min_skin:
             score -= 30
             messages.append(
                 "Could not detect natural human skin tones. "

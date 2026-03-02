@@ -22,6 +22,8 @@ staticfiles/
 # Test / sample data (not for production)
 approved/
 rejected/
+test/
+test_hijab/
 
 # IDE
 .vscode/

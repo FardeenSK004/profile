@@ -1,3 +1,4 @@
+#Clean django project entrypoint. For local development only.
 # Minimal entrypoint — for local development only.
 # For production, use: gunicorn pfp_validator.wsgi
 import subprocess
