@@ -4,6 +4,8 @@
 import subprocess
 import sys
 
+print("Starting Django development server...")
+
 if __name__ == "__main__":
     subprocess.run([
         "uv", "run", "python", "manage.py", "runserver", "127.0.0.1:8000"
