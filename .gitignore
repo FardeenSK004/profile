@@ -28,3 +28,4 @@ test_hijab/
 # IDE
 .vscode/
 .idea/
+.agent/
